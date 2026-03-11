@@ -322,7 +322,7 @@ def registrar_pago(data: PagoCreate) -> Dict[str, Any]:
             estado = CASE
                 WHEN (valor_pagado + %(abono)s) >= valor_total_esperado THEN 'PAGADA'
                 ELSE 'PAGADA_PARCIAL'
-            END,
+            END::banking.estado_cuota,
             fecha_pago_real = CASE
                 WHEN (valor_pagado + %(abono)s) >= valor_total_esperado THEN now()
                 ELSE NULL
@@ -354,9 +354,10 @@ def registrar_pago(data: PagoCreate) -> Dict[str, Any]:
     """
     query_upd_credito = """
         UPDATE banking.creditos
-        SET saldo_capital    = saldo_capital    - %(capital)s,
-            saldo_intereses  = saldo_intereses  - %(interes)s,
-            saldo_mora       = saldo_mora        - %(mora)s,
+        SET 
+            saldo_capital   = GREATEST(saldo_capital   - %(capital)s,   0),
+            saldo_intereses = GREATEST(saldo_intereses - %(interes)s, 0),
+            saldo_mora      = GREATEST(saldo_mora      - %(mora)s,      0),
             numero_cuotas_pagadas = numero_cuotas_pagadas + %(cuotas_completas)s,
             fecha_ultimo_pago_real = now(),
             estado = CASE
@@ -426,7 +427,10 @@ def registrar_pago(data: PagoCreate) -> Dict[str, Any]:
                 # Desglose proporcional: mora → interés → capital
                 mora_c = min(abono, float(cuota["interes_mora_causado"]))
                 abono -= mora_c
-                interes_c = min(abono, float(cuota["valor_interes"]))
+                if pendiente != float(cuota["valor_interes"]):
+                    interes_c = min(abono, float(cuota["valor_interes"]))
+                else:  # Si no hay interés pendiente, el abono va directo a capital
+                    interes_c = 0.0
                 abono -= interes_c
                 capital_c = abono
 
