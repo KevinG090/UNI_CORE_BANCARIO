@@ -3,6 +3,8 @@ from typing import List, Union
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.openapi.docs import get_redoc_html
+from fastapi.responses import HTMLResponse
 from pydantic import AnyHttpUrl
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
@@ -23,6 +25,8 @@ class Settings(BaseSettings):
     # Pool (psycopg2 no tiene pool nativo, se usa SimpleConnectionPool)
     POOL_MIN_CONN: int = 1
     POOL_MAX_CONN: int = 10
+    
+    URL_API_REDOC: str = "https://cdn.jsdelivr.net/npm/redoc@2.1.3/bundles/redoc.standalone.js"
 
     model_config = SettingsConfigDict(
         env_file=".env",
@@ -44,7 +48,7 @@ def get_application() -> FastAPI:
         description="API para el Core Bancario — gestión de clientes, cupos y créditos.",
         version="1.0.0",
         docs_url="/docs",
-        redoc_url="/redoc",
+        redoc_url=None,
     )
 
     application.add_middleware(
@@ -54,9 +58,10 @@ def get_application() -> FastAPI:
         allow_methods=["*"],
         allow_headers=["*"],
     )
-
+    
 
     return application
+
 
 
 app = get_application()
