@@ -27,7 +27,25 @@ class Settings(BaseSettings):
     POOL_MAX_CONN: int = 10
     
     URL_API_REDOC: str = "https://cdn.jsdelivr.net/npm/redoc@2.1.3/bundles/redoc.standalone.js"
+    # JWT — NUNCA hardcodear, siempre desde env
+    JWT_SECRET: str                        # openssl rand -hex 32
+    JWT_EXPIRE_MINUTES: int = 30           # Expiracion del token en minutos
 
+
+
+    OTP_EXPIRE_MINUTES: int = 5   # Cuanto dura el codigo
+    OTP_MAX_INTENTOS:   int = 3   # Intentos antes de invalidar
+    OTP_MAX_POR_HORA:   int = 3   # Solicitudes de OTP por hora
+
+    # Resend — obtener en https://resend.com/api-keys
+    RESEND_API_KEY: str
+
+    # RSA
+    REQ_PRIVATE_KEY:  str
+    REQ_PUBLIC_KEY:   str
+    RESP_PUBLIC_KEY:  str
+    RESP_PRIVATE_KEY: str
+    
     model_config = SettingsConfigDict(
         env_file=".env",
         case_sensitive=True,
