@@ -3,7 +3,7 @@ from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field
 from core.config import get_settings
 from core.email_service import enviar_otp
-from core.otp import contar_solicitudes_recientes, crear_otp
+from core.otp import contar_solicitudes_recientes, crear_otp, verificar_otp
 from db.queries.clientes.clientes_auth import obtener_cliente_por_identificacion
 from core.security import create_access_token
 
@@ -13,6 +13,7 @@ router = APIRouter()
 class LoginRequest(BaseModel):
     tipo_identificacion: str = Field(..., pattern="^(CC|CE|NIT|TI|PP)$")
     numero_identificacion: str = Field(..., max_length=20)
+    otp : str = Field(None, min_length=6, max_length=6)
 
 
 class LoginResponse(BaseModel):
@@ -33,16 +34,26 @@ def login(data: LoginRequest):
     Devuelve un JWT firmado con HS256.
     No expone datos sensibles en el token.
     """
+    err_credenciales = HTTPException(status_code=401, detail="Credenciales invalidas.")
+    
     cliente = obtener_cliente_por_identificacion(
         data.tipo_identificacion,
         data.numero_identificacion,
     )
     if not cliente:
         # Mismo mensaje para tipo incorrecto o numero incorrecto (evita enumeracion)
-        raise HTTPException(status_code=401, detail="Credenciales invalidas.")
+        raise err_credenciales
 
     if cliente["estado"] in ("BLOQUEADO", "INACTIVO"):
         raise HTTPException(status_code=403, detail="Cliente no habilitado.")
+    
+    if get_settings().VALIDATION_WITH_OTP: 
+    # if True: 
+        if not data.otp:
+            raise HTTPException(status_code=400, detail="Codigo OTP requerido.")
+        status_validation, msg_validation = verificar_otp(cliente["id"], data.otp)
+        if not status_validation:
+            raise HTTPException(status_code=401, detail=msg_validation)
 
     payload = {
         "sub": str(cliente["id"]),
@@ -79,6 +90,7 @@ async def request_otp(data: RequestOtp):
 
     cliente = obtener_cliente_por_identificacion(tipo, numero)
     if not cliente:
+        raise HTTPException(404, "Cliente no encontrado.")
         # Retornamos el mismo mensaje para no revelar si existe
         return {"ok": True, "message": msg_generico}
 
@@ -96,22 +108,22 @@ async def request_otp(data: RequestOtp):
             "Demasiadas solicitudes. Espera un momento antes de pedir otro codigo."
         )
 
-    # Generar OTP
-
     expire_min = getattr(settings, 'OTP_EXPIRE_MINUTES', 5)
-    codigo     = crear_otp(cliente_id)
+    # Generar OTP
+    if settings.VALIDATION_WITH_OTP:
+        codigo     = crear_otp(cliente_id)
 
-    # Enviar por correo
-    nombre = f"{cliente['primer_nombre']} {cliente['primer_apellido']}"
-    enviado = enviar_otp(
-        correo     = cliente["correo_electronico"],
-        nombre     = nombre,
-        codigo     = codigo,
-        expire_min = expire_min,
-    )
+        # Enviar por correo
+        nombre = f"{cliente['primer_nombre']} {cliente['primer_apellido']}"
+        enviado = enviar_otp(
+            correo     = cliente["correo_electronico"],
+            nombre     = nombre,
+            codigo     = codigo,
+            expire_min = expire_min,
+        )
 
-    if not enviado:
-        raise HTTPException(500, "Error al enviar el codigo. Intenta de nuevo.")
+        if not enviado:
+            raise HTTPException(500, "Error al enviar el codigo. Intenta de nuevo.")
 
     # Enmascarar el correo en la respuesta: j***@gmail.com
     correo = cliente["correo_electronico"]

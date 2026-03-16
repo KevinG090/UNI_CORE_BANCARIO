@@ -46,6 +46,8 @@ class Settings(BaseSettings):
     RESP_PUBLIC_KEY:  str
     RESP_PRIVATE_KEY: str
     
+    VALIDATION_WITH_OTP: bool = False  # Si True, se requiere OTP para validar clientes
+    
     model_config = SettingsConfigDict(
         env_file=".env",
         case_sensitive=True,
