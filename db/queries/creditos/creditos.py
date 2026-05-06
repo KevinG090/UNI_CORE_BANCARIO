@@ -255,10 +255,17 @@ def obtener_credito(credito_id: str) -> Optional[Dict[str, Any]]:
 def listar_creditos_por_cupo(cupo_id: str) -> List[Dict[str, Any]]:
     query = """
         SELECT
-            id, valor_credito, numero_cuotas_pactadas,
-            numero_cuotas_pagadas, valor_cuota,
-            saldo_capital, saldo_mora, saldo_total,
-            estado, fecha_desembolso, dias_mora_actuales
+            id,
+            valor_credito,
+            numero_cuotas_pactadas,
+            numero_cuotas_pagadas,
+            valor_cuota,
+            saldo_capital,
+            saldo_mora,
+            saldo_total,
+            estado,
+            fecha_desembolso,
+            dias_mora_actuales
         FROM banking.creditos
         WHERE cupo_id = %(cupo_id)s
         ORDER BY fecha_desembolso DESC;
@@ -394,7 +401,6 @@ def registrar_pago(data: PagoCreate) -> Dict[str, Any]:
         FROM banking.cupos cu
         WHERE cu.id = %(cupo_id)s;
     """
-
     with get_conn() as conn:
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
 
@@ -405,83 +411,82 @@ def registrar_pago(data: PagoCreate) -> Dict[str, Any]:
                 raise ValueError("Crédito no encontrado o ya pagado/anulado.")
 
             saldo_antes = float(credito["saldo_total"])
-            restante = data.valor_pago
+            restante = round(float(data.valor_pago), 2)
 
             # 2. Cuotas pendientes
             cur.execute(query_cuotas, {"credito_id": data.credito_id})
             cuotas = cur.fetchall()
 
-            total_capital = 0.0
-            total_interes = 0.0
-            total_mora    = 0.0
+            total_capital    = 0.0
+            total_interes    = 0.0
+            total_mora       = 0.0
             cuotas_completas = 0
-            distribuciones: list = []  # (cuota_id, abono)
+            distribuciones   = []
 
             for cuota in cuotas:
                 if restante <= 0:
                     break
-                pendiente = float(cuota["saldo_pendiente"])
+
+                pendiente    = round(float(cuota["saldo_pendiente"]), 2)
+                mora_cuota   = round(float(cuota["interes_mora_causado"]), 2)
+                interes_cuota = round(float(cuota["valor_interes"]), 2)
+                # Capital pendiente = total pendiente - mora pendiente - interés pendiente
+                # (simplificado: lo que queda después de mora e interés)
                 abono = min(restante, pendiente)
                 restante = round(restante - abono, 2)
 
-                # Desglose proporcional: mora → interés → capital
-                mora_c = min(abono, float(cuota["interes_mora_causado"]))
-                abono -= mora_c
-                if pendiente != float(cuota["valor_interes"]):
-                    interes_c = min(abono, float(cuota["valor_interes"]))
-                else:  # Si no hay interés pendiente, el abono va directo a capital
-                    interes_c = 0.0
-                abono -= interes_c
-                capital_c = abono
+                # Distribución: mora → interés → capital
+                mora_c    = min(abono, mora_cuota)
+                abono_r   = round(abono - mora_c, 2)
 
-                total_mora    += mora_c
-                total_interes += interes_c
-                total_capital += capital_c
+                interes_c = min(abono_r, interes_cuota)
+                abono_r   = round(abono_r - interes_c, 2)
 
-                abono_total = mora_c + interes_c + capital_c
+                capital_c = abono_r  # todo lo que queda va a capital
+
+                total_mora    = round(total_mora    + mora_c,    2)
+                total_interes = round(total_interes + interes_c, 2)
+                total_capital = round(total_capital + capital_c, 2)
+
+                abono_total = round(mora_c + interes_c + capital_c, 2)
                 if abono_total >= pendiente:
                     cuotas_completas += 1
 
-                distribuciones.append((str(cuota["id"]), round(abono_total, 2)))
-
+                distribuciones.append((str(cuota["id"]), abono_total))
                 cur.execute(query_upd_cuota_parcial, {
-                    "abono": round(abono_total, 2),
+                    "abono":    abono_total,
                     "cuota_id": str(cuota["id"]),
                 })
 
-            total_capital = round(total_capital, 2)
-            total_interes = round(total_interes, 2)
-            total_mora    = round(total_mora, 2)
-            cupo_liberado = total_capital  # Solo el capital libera cupo
-            saldo_despues = round(saldo_antes - data.valor_pago + restante, 2)
-
+            # ✅ valor_pago real = lo efectivamente aplicado (excluye sobrante)
+            valor_pago_real = round(total_capital + total_interes + total_mora, 2)
+            cupo_liberado   = total_capital
+            saldo_despues   = max(0.0, round(saldo_antes - valor_pago_real, 2))
             # 3. Insertar pago
             cur.execute(query_pago, {
-                "credito_id": data.credito_id,
-                "cupo_id":    str(credito["cupo_id"]),
-                "valor_pago": data.valor_pago,
-                "capital":    total_capital,
-                "interes":    total_interes,
-                "mora":       total_mora,
-                "canal":      data.canal_pago,
-                "ref":        data.referencia_externa,
+                "credito_id":    data.credito_id,
+                "cupo_id":       str(credito["cupo_id"]),
+                "valor_pago":    valor_pago_real,   # ✅ no data.valor_pago
+                "capital":       total_capital,
+                "interes":       total_interes,
+                "mora":          total_mora,
+                "canal":         data.canal_pago,
+                "ref":           data.referencia_externa,
                 "saldo_antes":   saldo_antes,
-                "saldo_despues": max(0.0, saldo_despues),
+                "saldo_despues": saldo_despues,
                 "cupo_liberado": cupo_liberado,
-                "usuario":    data.usuario,
+                "usuario":       data.usuario,
             })
             pago = dict(cur.fetchone())
             pago_id = str(pago["id"])
 
-            # 4. Detalle pagos
             for cuota_id, valor_apl in distribuciones:
                 cur.execute(query_detalle, {
-                    "pago_id": pago_id,
+                    "pago_id":  pago_id,
                     "cuota_id": cuota_id,
-                    "valor": valor_apl,
+                    "valor":    valor_apl,
                 })
 
-            # 5. Actualizar crédito
             cur.execute(query_upd_credito, {
                 "capital":          total_capital,
                 "interes":          total_interes,
@@ -490,13 +495,11 @@ def registrar_pago(data: PagoCreate) -> Dict[str, Any]:
                 "credito_id":       data.credito_id,
             })
 
-            # 6. Liberar cupo
             cur.execute(query_upd_cupo, {
                 "cupo_liberado": cupo_liberado,
                 "cupo_id":       str(credito["cupo_id"]),
             })
 
-            # 7. Movimiento de cupo
             cur.execute(query_mov_credito, {
                 "credito_id":    data.credito_id,
                 "pago_id":       pago_id,
@@ -509,4 +512,6 @@ def registrar_pago(data: PagoCreate) -> Dict[str, Any]:
             pago["interes_abonado"]  = total_interes
             pago["mora_abonada"]     = total_mora
             pago["cuotas_saldadas"]  = cuotas_completas
+            pago["valor_pago_real"]  = valor_pago_real   # útil para el front
+            pago["sobrante"]         = round(data.valor_pago - valor_pago_real, 2)
             return pago
