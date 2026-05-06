@@ -7,6 +7,8 @@ from db.queries.creditos.creditos import (
     obtener_cuotas,
     registrar_pago,
 )
+from db.queries.creditos.movimientos_credito import obtener_timeline_credito
+
 from schemas.creditos import CompraCreate, PagoCreate
 
 router = APIRouter()
@@ -57,3 +59,12 @@ async def post_pago(data: PagoCreate):
         raise HTTPException(400, str(e))
     except Exception as e:
         raise HTTPException(500, str(e))
+
+
+
+@router.get("/{credito_id}/timeline", summary="Timeline completo del crédito")
+async def get_timeline_credito(credito_id: str):
+    resultado = obtener_timeline_credito(credito_id)
+    if not resultado:
+        raise HTTPException(404, "Crédito no encontrado.")
+    return resultado
