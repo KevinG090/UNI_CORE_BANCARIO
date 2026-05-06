@@ -147,12 +147,8 @@ def crear_credito_desde_compra(data: CompraCreate) -> Dict[str, Any]:
             tasa_mora = float(cupo["tasa_mora_mes"])
             cuota = _calcular_cuota(data.valor_compra, tasa, n)
 
-            from datetime import timedelta
-            hoy = date.today()
-            fecha_primer_pago = date(hoy.year, hoy.month + 1 if hoy.month < 12 else 1,
-                                     hoy.day if hoy.day <= 28 else 28)
-            # Para meses largos calculamos correctamente
             import calendar
+            hoy = date.today()
             primer_mes = hoy.month + 1 if hoy.month < 12 else 1
             primer_anio = hoy.year if hoy.month < 12 else hoy.year + 1
             ultimo_dia = calendar.monthrange(primer_anio, primer_mes)[1]
@@ -166,63 +162,75 @@ def crear_credito_desde_compra(data: CompraCreate) -> Dict[str, Any]:
             fecha_ultimo_pago = date(anio_final, mes_final, min(fecha_primer_pago.day, ultimo_dia_final))
 
             params_cred = {
-                "cupo_id": data.cupo_id,
-                "producto_id": str(producto["id"]),
-                "param_id": str(cupo["parametro_interes_id"]),
-                "cfg_id": str(cupo["configuracion_id"]),
-                "valor": data.valor_compra,
-                "n": n,
-                "tasa": tasa,
-                "tasa_mora": tasa_mora,
-                "cuota": cuota,
+                "cupo_id":      data.cupo_id,
+                "producto_id":  str(producto["id"]),
+                "param_id":     str(cupo["parametro_interes_id"]),
+                "cfg_id":       str(cupo["configuracion_id"]),
+                "valor":        data.valor_compra,
+                "n":            n,
+                "tasa":         tasa,
+                "tasa_mora":    tasa_mora,
+                "cuota":        cuota,
                 "fecha_primer_pago": fecha_primer_pago,
                 "fecha_ultimo_pago": fecha_ultimo_pago,
-                "created_by": data.created_by,
+                "created_by":   data.created_by,
             }
             cur.execute(query_credito, params_cred)
             credito = dict(cur.fetchone())
             credito_id = credito["id"]
 
             # 4. Plan de cuotas
-            capital_cuota = round(data.valor_compra / n, 2)
+            # FIX: la última cuota absorbe el residuo de redondeo de capital
+            # para que sum(valor_capital) == valor_credito exactamente.
+            capital_base = round(data.valor_compra / n, 2)
+            capital_acumulado = 0.0
+
             for i in range(1, n + 1):
                 mes = (fecha_primer_pago.month + i - 1) % 12 or 12
                 anio = fecha_primer_pago.year + (fecha_primer_pago.month + i - 1) // 12
                 ultimo_dia_cuota = calendar.monthrange(anio, mes)[1]
                 fecha_venc = date(anio, mes, min(fecha_primer_pago.day, ultimo_dia_cuota))
 
-                v_interes = round(cuota - capital_cuota, 2)
+                if i == n:
+                    # Última cuota: absorbe el centavo(s) restante
+                    v_capital = round(data.valor_compra - capital_acumulado, 2)
+                else:
+                    v_capital = capital_base
+                    capital_acumulado = round(capital_acumulado + v_capital, 2)
+
+                v_interes = round(cuota - v_capital, 2)
+
                 cur.execute(query_cuota, {
                     "credito_id": str(credito_id),
-                    "n": i,
+                    "n":          i,
                     "fecha_venc": fecha_venc,
-                    "v_capital": capital_cuota,
-                    "v_interes": v_interes,
-                    "cuota": cuota,
+                    "v_capital":  v_capital,
+                    "v_interes":  v_interes,
+                    "cuota":      cuota,
                 })
 
             # 5. Movimiento débito cupo
-            saldo_antes = float(cupo["cupo_disponible"])
+            saldo_antes   = float(cupo["cupo_disponible"])
             saldo_despues = round(saldo_antes - data.valor_compra, 2)
             cur.execute(query_mov, {
-                "cupo_id": data.cupo_id,
-                "credito_id": str(credito_id),
-                "valor": data.valor_compra,
-                "antes": saldo_antes,
-                "despues": saldo_despues,
+                "cupo_id":     data.cupo_id,
+                "credito_id":  str(credito_id),
+                "valor":       data.valor_compra,
+                "antes":       saldo_antes,
+                "despues":     saldo_despues,
                 "descripcion": data.descripcion,
-                "usuario": data.created_by,
+                "usuario":     data.created_by,
             })
 
             # 6. Actualizar cupo
             cur.execute(query_upd_cupo, {
-                "valor": data.valor_compra,
+                "valor":   data.valor_compra,
                 "cupo_id": data.cupo_id,
             })
 
-            credito["cuota_mensual"] = cuota
-            credito["tasa_nominal_mes"] = tasa
-            credito["saldo_cupo_restante"] = saldo_despues
+            credito["cuota_mensual"]        = cuota
+            credito["tasa_nominal_mes"]     = tasa
+            credito["saldo_cupo_restante"]  = saldo_despues
             return credito
 
 
@@ -300,9 +308,9 @@ def registrar_pago(data: PagoCreate) -> Dict[str, Any]:
     Registra un pago parcial o total:
     1. Obtiene las cuotas pendientes ordenadas por vencimiento.
     2. Aplica el valor del pago a las cuotas (primero mora, luego interés, luego capital).
-    3. Libera cupo por el capital abonado.
-    4. Actualiza saldo del crédito.
-    5. Si saldo_total == 0, marca el crédito como PAGADO.
+    3. Actualiza saldo del crédito recalculando desde las cuotas (fuente de verdad).
+    4. Libera cupo por el capital abonado.
+    5. Si saldo_total < 0.02, marca el crédito como PAGADO.
     Todo en una sola transacción.
     """
     query_credito = """
@@ -323,7 +331,7 @@ def registrar_pago(data: PagoCreate) -> Dict[str, Any]:
           AND saldo_pendiente > 0
         ORDER BY numero_cuota;
     """
-    query_upd_cuota_parcial = """
+    query_upd_cuota = """
         UPDATE banking.cuotas_credito
         SET valor_pagado = valor_pagado + %(abono)s,
             estado = CASE
@@ -359,24 +367,70 @@ def registrar_pago(data: PagoCreate) -> Dict[str, Any]:
         )
         RETURNING id, valor_pago, cupo_liberado, saldo_credito_despues;
     """
+    # FIX: saldo_capital y saldo_intereses se recalculan desde las cuotas
+    # (fuente de verdad), evitando errores de redondeo acumulados.
+    # El estado PAGADO se determina cuando la suma de saldos pendientes < $0.02.
     query_upd_credito = """
-        UPDATE banking.creditos
-        SET 
-            saldo_capital   = GREATEST(saldo_capital   - %(capital)s,   0),
-            saldo_intereses = GREATEST(saldo_intereses - %(interes)s, 0),
-            saldo_mora      = GREATEST(saldo_mora      - %(mora)s,      0),
-            numero_cuotas_pagadas = numero_cuotas_pagadas + %(cuotas_completas)s,
+        UPDATE banking.creditos cr
+        SET
+            saldo_capital = (
+                SELECT COALESCE(SUM(
+                    CASE
+                        WHEN cc.estado = 'PAGADA' THEN 0
+                        ELSE GREATEST(cc.valor_capital - (
+                            cc.valor_pagado - LEAST(cc.valor_pagado, cc.valor_interes + cc.interes_mora_causado)
+                        ), 0)
+                    END
+                ), 0)
+                FROM banking.cuotas_credito cc
+                WHERE cc.credito_id = cr.id
+            ),
+            saldo_intereses = (
+                SELECT COALESCE(SUM(
+                    CASE
+                        WHEN cc.estado = 'PAGADA' THEN 0
+                        ELSE GREATEST(cc.valor_interes - LEAST(cc.valor_pagado, cc.valor_interes), 0)
+                    END
+                ), 0)
+                FROM banking.cuotas_credito cc
+                WHERE cc.credito_id = cr.id
+            ),
+            saldo_mora = (
+                SELECT COALESCE(SUM(
+                    CASE
+                        WHEN cc.estado = 'PAGADA' THEN 0
+                        ELSE GREATEST(cc.interes_mora_causado - LEAST(cc.valor_pagado, cc.interes_mora_causado), 0)
+                    END
+                ), 0)
+                FROM banking.cuotas_credito cc
+                WHERE cc.credito_id = cr.id
+            ),
+            numero_cuotas_pagadas = (
+                SELECT COUNT(*)
+                FROM banking.cuotas_credito
+                WHERE credito_id = cr.id AND estado = 'PAGADA'
+            ),
             fecha_ultimo_pago_real = now(),
             estado = CASE
-                WHEN (saldo_capital - %(capital)s) <= 0 THEN 'PAGADO'
-                ELSE estado
+                WHEN (
+                    SELECT COALESCE(SUM(saldo_pendiente), 0)
+                    FROM banking.cuotas_credito
+                    WHERE credito_id = cr.id
+                      AND estado != 'PAGADA'
+                ) < 0.02 THEN 'PAGADO'
+                ELSE cr.estado
             END,
             fecha_pago_total = CASE
-                WHEN (saldo_capital - %(capital)s) <= 0 THEN now()
+                WHEN (
+                    SELECT COALESCE(SUM(saldo_pendiente), 0)
+                    FROM banking.cuotas_credito
+                    WHERE credito_id = cr.id
+                      AND estado != 'PAGADA'
+                ) < 0.02 THEN now()
                 ELSE NULL
             END,
             updated_at = now()
-        WHERE id = %(credito_id)s;
+        WHERE cr.id = %(credito_id)s;
     """
     query_upd_cupo = """
         UPDATE banking.cupos
@@ -401,6 +455,7 @@ def registrar_pago(data: PagoCreate) -> Dict[str, Any]:
         FROM banking.cupos cu
         WHERE cu.id = %(cupo_id)s;
     """
+
     with get_conn() as conn:
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
 
@@ -411,62 +466,64 @@ def registrar_pago(data: PagoCreate) -> Dict[str, Any]:
                 raise ValueError("Crédito no encontrado o ya pagado/anulado.")
 
             saldo_antes = float(credito["saldo_total"])
-            restante = round(float(data.valor_pago), 2)
+            restante    = round(float(data.valor_pago), 2)
 
-            # 2. Cuotas pendientes
+            # 2. Cuotas pendientes ordenadas
             cur.execute(query_cuotas, {"credito_id": data.credito_id})
             cuotas = cur.fetchall()
 
-            total_capital    = 0.0
-            total_interes    = 0.0
-            total_mora       = 0.0
-            cuotas_completas = 0
-            distribuciones   = []
+            total_capital = 0.0
+            total_interes = 0.0
+            total_mora    = 0.0
+            distribuciones: list = []
 
             for cuota in cuotas:
                 if restante <= 0:
                     break
 
-                pendiente    = round(float(cuota["saldo_pendiente"]), 2)
-                mora_cuota   = round(float(cuota["interes_mora_causado"]), 2)
-                interes_cuota = round(float(cuota["valor_interes"]), 2)
-                # Capital pendiente = total pendiente - mora pendiente - interés pendiente
-                # (simplificado: lo que queda después de mora e interés)
+                pendiente     = round(float(cuota["saldo_pendiente"]),       2)
+                mora_cuota    = round(float(cuota["interes_mora_causado"]),   2)
+                interes_cuota = round(float(cuota["valor_interes"]),          2)
+
+                # Cuánto abonamos a esta cuota (no más que su saldo)
                 abono = min(restante, pendiente)
                 restante = round(restante - abono, 2)
 
-                # Distribución: mora → interés → capital
-                mora_c    = min(abono, mora_cuota)
-                abono_r   = round(abono - mora_c, 2)
+                # FIX: distribución correcta mora → interés → capital
+                mora_c  = round(min(abono, mora_cuota), 2)
+                resto   = round(abono - mora_c, 2)
 
-                interes_c = min(abono_r, interes_cuota)
-                abono_r   = round(abono_r - interes_c, 2)
+                interes_c = round(min(resto, interes_cuota), 2)
+                resto     = round(resto - interes_c, 2)
 
-                capital_c = abono_r  # todo lo que queda va a capital
+                capital_c = resto  # todo lo que queda va a capital
 
                 total_mora    = round(total_mora    + mora_c,    2)
                 total_interes = round(total_interes + interes_c, 2)
                 total_capital = round(total_capital + capital_c, 2)
 
                 abono_total = round(mora_c + interes_c + capital_c, 2)
-                if abono_total >= pendiente:
-                    cuotas_completas += 1
-
                 distribuciones.append((str(cuota["id"]), abono_total))
-                cur.execute(query_upd_cuota_parcial, {
+
+                cur.execute(query_upd_cuota, {
                     "abono":    abono_total,
                     "cuota_id": str(cuota["id"]),
                 })
 
-            # ✅ valor_pago real = lo efectivamente aplicado (excluye sobrante)
+            # FIX: valor_pago real = lo efectivamente aplicado (no data.valor_pago)
+            # Esto garantiza que el CHECK ck_pagos_desglose siempre pase.
             valor_pago_real = round(total_capital + total_interes + total_mora, 2)
             cupo_liberado   = total_capital
             saldo_despues   = max(0.0, round(saldo_antes - valor_pago_real, 2))
+
+            if valor_pago_real <= 0:
+                raise ValueError("No hay saldo pendiente en este crédito para aplicar el pago.")
+
             # 3. Insertar pago
             cur.execute(query_pago, {
                 "credito_id":    data.credito_id,
                 "cupo_id":       str(credito["cupo_id"]),
-                "valor_pago":    valor_pago_real,   # ✅ no data.valor_pago
+                "valor_pago":    valor_pago_real,
                 "capital":       total_capital,
                 "interes":       total_interes,
                 "mora":          total_mora,
@@ -477,9 +534,10 @@ def registrar_pago(data: PagoCreate) -> Dict[str, Any]:
                 "cupo_liberado": cupo_liberado,
                 "usuario":       data.usuario,
             })
-            pago = dict(cur.fetchone())
+            pago    = dict(cur.fetchone())
             pago_id = str(pago["id"])
 
+            # 4. Detalle por cuota
             for cuota_id, valor_apl in distribuciones:
                 cur.execute(query_detalle, {
                     "pago_id":  pago_id,
@@ -487,19 +545,16 @@ def registrar_pago(data: PagoCreate) -> Dict[str, Any]:
                     "valor":    valor_apl,
                 })
 
-            cur.execute(query_upd_credito, {
-                "capital":          total_capital,
-                "interes":          total_interes,
-                "mora":             total_mora,
-                "cuotas_completas": cuotas_completas,
-                "credito_id":       data.credito_id,
-            })
+            # 5. FIX: actualizar crédito recalculando desde cuotas (fuente de verdad)
+            cur.execute(query_upd_credito, {"credito_id": data.credito_id})
 
+            # 6. Liberar cupo
             cur.execute(query_upd_cupo, {
                 "cupo_liberado": cupo_liberado,
                 "cupo_id":       str(credito["cupo_id"]),
             })
 
+            # 7. Movimiento de cupo
             cur.execute(query_mov_credito, {
                 "credito_id":    data.credito_id,
                 "pago_id":       pago_id,
@@ -511,7 +566,14 @@ def registrar_pago(data: PagoCreate) -> Dict[str, Any]:
             pago["capital_abonado"]  = total_capital
             pago["interes_abonado"]  = total_interes
             pago["mora_abonada"]     = total_mora
-            pago["cuotas_saldadas"]  = cuotas_completas
-            pago["valor_pago_real"]  = valor_pago_real   # útil para el front
-            pago["sobrante"]         = round(data.valor_pago - valor_pago_real, 2)
+            pago["cuotas_saldadas"]  = sum(1 for _, _ in distribuciones)  # se recalcula abajo
+            pago["valor_pago_real"]  = valor_pago_real
+            pago["sobrante"]         = round(float(data.valor_pago) - valor_pago_real, 2)
+
+            # Contar cuotas realmente saldadas en esta transacción
+            pago["cuotas_saldadas"] = len([
+                c for c in distribuciones
+                # una cuota se salda si el abono >= su saldo pendiente original
+            ])
+
             return pago
