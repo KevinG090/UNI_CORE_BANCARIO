@@ -73,7 +73,7 @@ def crear_credito_desde_compra(data: CompraCreate) -> Dict[str, Any]:
             %(valor)s, %(n)s, 0,
             0, %(tasa)s, %(tasa_mora)s,
             0, %(cuota)s,
-            %(valor)s, 0, 0,
+            %(valor)s, %(interes_total)s, 0,
             now(),
             %(fecha_primer_pago)s,
             %(fecha_ultimo_pago)s,
@@ -146,6 +146,7 @@ def crear_credito_desde_compra(data: CompraCreate) -> Dict[str, Any]:
             tasa = float(cupo["tasa_interes_nominal_mes"])
             tasa_mora = float(cupo["tasa_mora_mes"])
             cuota = _calcular_cuota(data.valor_compra, tasa, n)
+            interes_total = round((cuota * n) - data.valor_compra, 2)
 
             import calendar
             hoy = date.today()
@@ -173,6 +174,7 @@ def crear_credito_desde_compra(data: CompraCreate) -> Dict[str, Any]:
                 "cuota":        cuota,
                 "fecha_primer_pago": fecha_primer_pago,
                 "fecha_ultimo_pago": fecha_ultimo_pago,
+                "interes_total":  interes_total,
                 "created_by":   data.created_by,
             }
             cur.execute(query_credito, params_cred)
@@ -571,9 +573,17 @@ def registrar_pago(data: PagoCreate) -> Dict[str, Any]:
             pago["sobrante"]         = round(float(data.valor_pago) - valor_pago_real, 2)
 
             # Contar cuotas realmente saldadas en esta transacción
-            pago["cuotas_saldadas"] = len([
-                c for c in distribuciones
-                # una cuota se salda si el abono >= su saldo pendiente original
-            ])
+            cuotas_completas = 0
+            for cuota in cuotas:
+                ...
+                abono_total = round(mora_c + interes_c + capital_c, 2)
+                
+                if abono_total >= pendiente:   # ← saldo cubierto al 100%
+                    cuotas_completas += 1
+                
+                distribuciones.append((str(cuota["id"]), abono_total))
+                ...
 
+            # Al final, reemplazar la línea del len([...])
+            pago["cuotas_saldadas"] = cuotas_completas
             return pago
